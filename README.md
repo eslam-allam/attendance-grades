@@ -63,14 +63,17 @@ attendance-grades myReport.csv --include-excused --width 100
 
 ```
 effective_absences = absences + lates / lates_per_absence
-sessions_counted   = present + absences + lates
+sessions_counted   = delivered_sessions - excused_absences
 grade              = max_grade * (1 - effective_absences / sessions_counted)
 ```
 
 * 100% attendance → `5.00`, 50% attendance → `2.50` (with the defaults).
+* Sessions are measured against the report's **Total Delivered Sessions**, not
+  just the cells that happen to contain a status. A student with 4 absences out
+  of 8 delivered sessions is at 50%, even if the remaining cells are blank.
 * Every 3 lates count as 1 absence (each late costs `1/3` of an absence).
 * Excused absences (`Sick`, `Bereavement`, `Other`, `Competition/event`, …) are
-  excluded from both the penalty and the denominator, so they neither help nor
+  removed from both the penalty and the denominator, so they neither help nor
   hurt the grade. Use `--include-excused` to penalise them instead.
 * Blank session cells are ignored.
 * Students are listed alphabetically within each section; sections are sorted

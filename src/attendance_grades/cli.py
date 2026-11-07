@@ -3,13 +3,15 @@
 Grading rule
 ------------
     effective_absences = absences + lates / lates_per_absence
-    sessions_counted   = present + absences + lates
+    sessions_counted   = delivered_sessions - excused_absences
     grade              = max_grade * (1 - effective_absences / sessions_counted)
 
-Excused absences (Sick, Bereavement, Other, Competition/event, ...) are left
-out of the calculation entirely: they are neither penalised nor counted in the
-denominator.  Blank cells are ignored too.  Every third late therefore turns
-into one absence (unless ``--lates-per-absence`` is changed).
+Sessions are measured against the report's "Total Delivered Sessions", so blank
+cells do not magically turn an absence into 100% absence.  Excused absences
+(Sick, Bereavement, Other, Competition/event, ...) are removed from the
+denominator as well as from the penalty.  Blank cells are ignored.  Every third
+late therefore turns into one absence (unless ``--lates-per-absence`` is
+changed).
 
 The formula's knobs are exposed on the command line; see ``--help``.
 """
@@ -79,10 +81,17 @@ def parse_report(path: Path) -> dict[str, list[dict[str, object]]]:
                 # Title rows, column headers, trailing separator rows, ...
                 continue
 
+            def number(index: int) -> int:
+                try:
+                    return int(float(row[index].strip()))
+                except (ValueError, IndexError):
+                    return 0
+
             sections[current_section].append(
                 {
                     "name": name,
                     "grn": grn,
+                    "delivered": number(3),  # Total Delivered Sessions
                     "statuses": [s for s in (cell.strip() for cell in row[FIRST_SESSION_COLUMN:]) if s],
                 }
             )
@@ -111,15 +120,25 @@ def categorize(statuses: list[str], excused: set[str]) -> dict[str, int]:
     return counts
 
 
-def calculate_grade(counts: dict[str, int], config: GradeConfig) -> dict[str, float | int]:
+def calculate_grade(
+    counts: dict[str, int],
+    delivered: int,
+    config: GradeConfig,
+) -> dict[str, float | int]:
     present = counts["present"]
     absences = counts["absent"]
     lates = counts["late"]
+    excused = counts["excused"]
 
-    sessions = present + absences + lates
+    # Grade against the sessions that were actually delivered.  Excused
+    # absences are removed from both sides of the ratio unless the caller
+    # explicitly asks to count them.
+    sessions = delivered if delivered > 0 else present + absences + lates
     if config.include_excused:
-        absences += counts["excused"]
-        sessions += counts["excused"]
+        absences += excused
+    else:
+        sessions -= excused
+    sessions = max(sessions, 0)
 
     effective_absences = absences + lates / config.lates_per_absence
 
@@ -152,11 +171,13 @@ def iter_rows(
         students = sorted(sections[section], key=lambda s: str(s["name"]).casefold())
         for student in students:
             counts = categorize(student["statuses"], excused)  # type: ignore[arg-type]
-            result = calculate_grade(counts, config)
+            delivered = int(student["delivered"])  # type: ignore[arg-type]
+            result = calculate_grade(counts, delivered, config)
             yield {
                 "section": section,
                 "name": student["name"],
                 "grn": student["grn"],
+                "delivered": delivered,
                 **counts,
                 **result,
             }
@@ -238,18 +259,19 @@ def render_markdown(
         lines.append(f"### {section}")
         lines.append("")
         lines.append(
-            "| Student Name | GRN | Sessions | Present | Absences | Excused | Lates "
+            "| Student Name | GRN | Delivered | Counted | Present | Absences | Excused | Lates "
             f"| Effective Absences | Attendance % | {grade_header} |"
         )
-        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
         for row in iter_rows({section: sections[section]}, excused, config):
             grade = format_number(float(row["grade"]), config.decimals)
             lines.append(
-                "| {name} | {grn} | {sessions} | {present} | {absent} | {excused} | {late} "
+                "| {name} | {grn} | {delivered} | {sessions} | {present} | {absent} | {excused} | {late} "
                 "| {effective:.2f} | {pct:.1f}% | {grade} |".format(
                     name=row["name"],
                     grn=row["grn"],
+                    delivered=row["delivered"],
                     sessions=row["sessions"],
                     present=row["present"],
                     absent=row["absent"],
@@ -277,7 +299,8 @@ def render_csv(
             "Section",
             "Student Name",
             "GRN",
-            "Sessions",
+            "Delivered",
+            "Counted",
             "Present",
             "Absences",
             "Excused",
@@ -294,6 +317,7 @@ def render_csv(
                 row["section"],
                 row["name"],
                 row["grn"],
+                row["delivered"],
                 row["sessions"],
                 row["present"],
                 row["absent"],
@@ -349,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="attendance-grades",
         description=(
             "Compute per-section attendance grades from an attendance report. "
-            "By default: Grade = 5 * (1 - (absences + lates/3) / sessions), "
+            "By default: Grade = 5 * (1 - (absences + lates/3) / delivered sessions), "
             "with excused absences excluded."
         ),
     )
