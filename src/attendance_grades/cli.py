@@ -161,14 +161,26 @@ def section_sort_key(section: str) -> list[object]:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", section)]
 
 
+def student_sort_key(name: str, mode: str) -> tuple[str, ...]:
+    """Sort by full name, or by last name then first name."""
+    parts = name.split()
+    if mode == "last-name" and parts:
+        return (parts[-1].casefold(), " ".join(parts[:-1]).casefold(), name.casefold())
+    return (name.casefold(),)
+
+
 def iter_rows(
     sections: dict[str, list[dict[str, object]]],
     excused: set[str],
     config: GradeConfig,
+    sort_by: str = "full-name",
 ) -> Iterator[dict[str, object]]:
     """Yield one fully calculated row per student, sections/names sorted."""
     for section in sorted(sections, key=section_sort_key):
-        students = sorted(sections[section], key=lambda s: str(s["name"]).casefold())
+        students = sorted(
+            sections[section],
+            key=lambda s: student_sort_key(str(s["name"]), sort_by),
+        )
         for student in students:
             counts = categorize(student["statuses"], excused)  # type: ignore[arg-type]
             delivered = int(student["delivered"])  # type: ignore[arg-type]
@@ -203,9 +215,10 @@ def render_table(
     excused: set[str],
     config: GradeConfig,
     console: Console,
+    sort_by: str = "full-name",
 ) -> None:
     for section in sorted(sections, key=section_sort_key):
-        rows = list(iter_rows({section: sections[section]}, excused, config))
+        rows = list(iter_rows({section: sections[section]}, excused, config, sort_by))
 
         table = Table(
             box=box.ROUNDED,
@@ -251,6 +264,7 @@ def render_markdown(
     sections: dict[str, list[dict[str, object]]],
     excused: set[str],
     config: GradeConfig,
+    sort_by: str = "full-name",
 ) -> str:
     lines: list[str] = []
     grade_header = f"Grade /{config.max_grade:g}"
@@ -264,7 +278,7 @@ def render_markdown(
         )
         lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
-        for row in iter_rows({section: sections[section]}, excused, config):
+        for row in iter_rows({section: sections[section]}, excused, config, sort_by):
             grade = format_number(float(row["grade"]), config.decimals)
             lines.append(
                 "| {name} | {grn} | {delivered} | {sessions} | {present} | {absent} | {excused} | {late} "
@@ -291,6 +305,7 @@ def render_csv(
     sections: dict[str, list[dict[str, object]]],
     excused: set[str],
     config: GradeConfig,
+    sort_by: str = "full-name",
 ) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -311,7 +326,7 @@ def render_csv(
         ]
     )
 
-    for row in iter_rows(sections, excused, config):
+    for row in iter_rows(sections, excused, config, sort_by):
         writer.writerow(
             [
                 row["section"],
@@ -416,6 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="count excused absences against the student (off by default)",
     )
     parser.add_argument(
+        "--sort",
+        choices=("full-name", "last-name"),
+        default="full-name",
+        help="student sort order: full name, or last name then rest of name (default: %(default)s)",
+    )
+    parser.add_argument(
         "--format",
         choices=("table", "markdown", "csv"),
         default="table",
@@ -452,14 +473,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.format == "csv":
-        print(render_csv(sections, excused, config), end="")
+        print(render_csv(sections, excused, config, args.sort), end="")
     elif args.format == "markdown":
-        print(render_markdown(sections, excused, config), end="")
+        print(render_markdown(sections, excused, config, args.sort), end="")
     else:
         render_table(
             sections,
             excused,
             config,
             Console(width=terminal_width(args.width)),
+            args.sort,
         )
     return 0

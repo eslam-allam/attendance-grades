@@ -40,6 +40,7 @@ attendance-grades
 | `--lates-per-absence N` | `3` | How many lates equal one absence |
 | `--max-grade N` | `5` | Maximum grade |
 | `--decimals N` | `2` | Decimal places in the grade column (0–6) |
+| `--sort` | `full-name` | `full-name` or `last-name` (last name, then rest of the name) |
 | `--format` | `table` | `table`, `markdown`, or `csv` |
 | `--width N` | auto | Table width in columns (`0` = auto-detect) |
 
@@ -57,6 +58,9 @@ attendance-grades myReport.csv --lates-per-absence 2 --max-grade 10 --decimals 1
 
 # Count excused absences as well, and narrow the table for a small terminal
 attendance-grades myReport.csv --include-excused --width 100
+
+# Sort each section by last name, then the rest of the name
+attendance-grades myReport.csv --sort last-name
 ```
 
 ## Grading rule
