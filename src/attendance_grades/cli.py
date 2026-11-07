@@ -449,6 +449,30 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="table width in columns; 0 means auto-detect (default: 0)",
     )
+    parser.add_argument(
+        "--push-canvas",
+        action="store_true",
+        help="prompt for Canvas URL/token and push grades to Canvas",
+    )
+    parser.add_argument(
+        "--canvas-grade-mode",
+        choices=("auto", "points", "percentage"),
+        default="auto",
+        help=(
+            "how to post grades: points, percentage, or auto "
+            "(points when the assignment is out of the max grade, otherwise percentage)"
+        ),
+    )
+    parser.add_argument(
+        "--canvas-dry-run",
+        action="store_true",
+        help="run the Canvas flow and preview matches without posting grades",
+    )
+    parser.add_argument(
+        "--canvas-show-archived",
+        action="store_true",
+        help="include archived/completed courses in the Canvas course list",
+    )
     return parser
 
 
@@ -472,6 +496,31 @@ def main(argv: list[str] | None = None) -> int:
         print("No attendance data found in the report.", file=sys.stderr)
         return 1
 
+    console = Console(width=terminal_width(args.width))
+
+    if args.push_canvas:
+        from .canvas import CanvasError, push_grades
+
+        grades_by_section = {
+            section: list(iter_rows({section: rows}, excused, config, args.sort))
+            for section, rows in sections.items()
+        }
+        try:
+            return push_grades(
+                grades_by_section,
+                config,
+                console=console,
+                dry_run=args.canvas_dry_run,
+                grade_mode=args.canvas_grade_mode,
+                show_archived=args.canvas_show_archived,
+            )
+        except CanvasError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            return 1
+
     if args.format == "csv":
         print(render_csv(sections, excused, config, args.sort), end="")
     elif args.format == "markdown":
@@ -481,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             sections,
             excused,
             config,
-            Console(width=terminal_width(args.width)),
+            console,
             args.sort,
         )
     return 0
