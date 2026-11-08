@@ -1,3 +1,3 @@
 """Attendance grade calculator."""
 
-__version__ = "0.6.0"
+__version__ = "0.8.0"

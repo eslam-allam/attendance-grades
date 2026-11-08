@@ -377,6 +377,23 @@ def non_negative_int(value: str) -> int:
     return number
 
 
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return number
+
+
+def positive_int(value: str) -> int:
+    number = non_negative_int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or greater")
+    return number
+
+
 def terminal_width(override: int) -> int:
     if override:
         return override
@@ -473,6 +490,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include archived/completed courses in the Canvas course list",
     )
+    parser.add_argument(
+        "--canvas-wait",
+        type=non_negative_float,
+        default=60.0,
+        metavar="SECONDS",
+        help=(
+            "how long to wait for Canvas to finish a bulk grade job; "
+            "0 means fire-and-forget (default: %(default)g)"
+        ),
+    )
+    parser.add_argument(
+        "--canvas-concurrency",
+        type=positive_int,
+        default=4,
+        metavar="N",
+        help=(
+            "parallel requests when falling back to per-student grading "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--canvas-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="read grades back from Canvas after posting (default: on)",
+    )
     return parser
 
 
@@ -513,6 +556,9 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.canvas_dry_run,
                 grade_mode=args.canvas_grade_mode,
                 show_archived=args.canvas_show_archived,
+                wait_timeout=args.canvas_wait,
+                concurrency=args.canvas_concurrency,
+                verify=args.canvas_verify,
             )
         except CanvasError as exc:
             console.print(f"[red]{exc}[/red]")

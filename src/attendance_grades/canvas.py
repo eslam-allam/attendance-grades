@@ -26,6 +26,7 @@ import re
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import httpx
@@ -263,6 +264,8 @@ class CanvasClient:
         course_id: int,
         assignment_id: int,
         grades: dict[int, str],
+        *,
+        max_workers: int = 4,
     ) -> tuple[str, dict[str, Any]]:
         """Post all grades at once; fall back to one request per student.
 
@@ -279,18 +282,92 @@ class CanvasClient:
         response = self._client.post(bulk_path, data=data)
 
         if response.status_code in (404, 405):
-            for user_id, grade in grades.items():
-                individual = self._client.put(
-                    f"/api/v1/courses/{course_id}/assignments/{assignment_id}"
-                    f"/submissions/{user_id}",
-                    data={"submission[posted_grade]": grade},
-                )
-                self._raise_for_status(individual)
+            self._post_grades_individually(
+                course_id, assignment_id, grades, max_workers=max_workers
+            )
             return "individual", {}
 
         self._raise_for_status(response)
         progress = response.json() if response.content else {}
         return "bulk", progress
+
+    def _post_grades_individually(
+        self,
+        course_id: int,
+        assignment_id: int,
+        grades: dict[int, str],
+        *,
+        max_workers: int = 4,
+    ) -> None:
+        """Fallback for Canvas servers without the bulk grading endpoint."""
+        errors: list[tuple[int, Exception]] = []
+
+        def post(user_id: int, grade: str) -> None:
+            response = self._client.put(
+                f"/api/v1/courses/{course_id}/assignments/{assignment_id}"
+                f"/submissions/{user_id}",
+                data={"submission[posted_grade]": grade},
+            )
+            self._raise_for_status(response)
+
+        workers = max(1, min(max_workers, len(grades)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(post, user_id, grade): user_id
+                for user_id, grade in grades.items()
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - reported per student
+                    errors.append((futures[future], exc))
+
+        if errors:
+            user_id, first_error = errors[0]
+            raise CanvasError(
+                f"{len(errors)} of {len(grades)} individual grade post(s) failed "
+                f"(first: user {user_id}: {first_error})"
+            )
+
+    def wait_for_progress(
+        self,
+        progress_id: int,
+        *,
+        timeout: float = 60.0,
+        interval: float = 0.5,
+    ) -> dict[str, Any] | None:
+        """Poll briefly for the background job; return None if it is still running."""
+        deadline = time.monotonic() + timeout
+        while True:
+            progress = self.progress(progress_id)
+            state = str(progress.get("workflow_state") or "")
+            if state in PROGRESS_STATES:
+                return progress
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(interval)
+
+    def list_submission_scores(
+        self,
+        course_id: int,
+        assignment_id: int,
+    ) -> dict[int, float | None]:
+        """Return {canvas_user_id: score} for an assignment, for verification."""
+        submissions = self.paginate(
+            f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions",
+            {"per_page": "100"},
+        )
+        scores: dict[int, float | None] = {}
+        for submission in submissions:
+            user_id = submission.get("user_id")
+            if user_id is None:
+                continue
+            score = submission.get("score")
+            try:
+                scores[int(user_id)] = None if score is None else float(score)
+            except (TypeError, ValueError):
+                scores[int(user_id)] = None
+        return scores
 
     def progress(self, progress_id: int) -> dict[str, Any]:
         return self.get_json(f"/api/v1/progress/{progress_id}")
@@ -551,20 +628,65 @@ def canvas_grade(grade: float, mode: str, config: GradeConfig) -> str:
     return format_number(grade, config.decimals)
 
 
-def wait_for_progress(client: CanvasClient, progress: dict[str, Any]) -> dict[str, Any]:
-    progress_id = progress.get("id")
-    if not progress_id:
-        return progress
+def expected_score(displayed: str, points_possible: Any) -> float | None:
+    """Convert the grade string we posted into the score Canvas should store."""
+    try:
+        if displayed.endswith("%"):
+            if not isinstance(points_possible, (int, float)):
+                return None
+            return float(displayed[:-1]) / 100 * float(points_possible)
+        return float(displayed)
+    except (TypeError, ValueError):
+        return None
 
-    deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
-        state = progress.get("workflow_state")
-        if state in PROGRESS_STATES:
-            return progress
-        time.sleep(1)
-        progress = client.progress(int(progress_id))
 
-    raise CanvasError("timed out waiting for the Canvas grade job to finish")
+def verify_posted_grades(
+    console: Console,
+    client: CanvasClient,
+    course_id: int,
+    assignment_id: int,
+    planned: list[tuple[dict[str, Any], dict[str, Any], str, str]],
+    points_possible: Any,
+) -> int | None:
+    """Read the grades back from Canvas and report any that did not land.
+
+    Returns the number of mismatches, or ``None`` if verification could not run.
+    """
+    try:
+        with console.status("Reading grades back from Canvas…", spinner="dots"):
+            actual = client.list_submission_scores(course_id, assignment_id)
+    except CanvasError as exc:
+        console.print(f"[yellow]Could not verify grades: {exc}[/yellow]")
+        return None
+
+    if not actual:
+        console.print("[yellow]Canvas returned no submission rows to verify against.[/yellow]")
+        return None
+
+    mismatches: list[tuple[dict[str, Any], float, float | None]] = []
+    for row, user, _label, displayed in planned:
+        expected = expected_score(displayed, points_possible)
+        if expected is None:
+            continue
+        got = actual.get(int(user["id"]))
+        if got is None or abs(got - expected) > 0.01:
+            mismatches.append((row, expected, got))
+
+    if not mismatches:
+        console.print(f"[green]Verified {len(planned)} grade(s) in Canvas.[/green]")
+        return 0
+
+    console.print(
+        f"[yellow]Canvas confirmed {len(planned) - len(mismatches)} of "
+        f"{len(planned)} grade(s). Not confirmed:[/yellow]"
+    )
+    for row, expected, got in mismatches:
+        shown = "no score" if got is None else f"{got:g}"
+        console.print(
+            f"  • {row['name']} ({row['grn']}): expected {expected:g}, "
+            f"Canvas shows {shown}"
+        )
+    return len(mismatches)
 
 
 # -- main flow -------------------------------------------------------------
@@ -578,6 +700,9 @@ def _push_grades(
     dry_run: bool = False,
     grade_mode: str = "auto",
     show_archived: bool = False,
+    wait_timeout: float = 60.0,
+    concurrency: int = 4,
+    verify: bool = True,
 ) -> int:
     console = console or Console()
     section_names = list(grades_by_section)
@@ -654,7 +779,9 @@ def _push_grades(
             return 1
 
         pushed = 0
+        confirmed = 0
         failures = 0
+        verification_failures = 0
 
         for course in selected_courses:
             course_id = int(course["id"])
@@ -817,39 +944,118 @@ def _push_grades(
                 for _row, user, _label, displayed in planned
             }
 
+            console.print(
+                f"\n[bold]Posting[/bold] {len(payload)} grade(s) to "
+                f"[cyan]{assignment.get('name')}[/cyan]…"
+            )
+
             try:
-                with console.status("Posting grades to Canvas...", spinner="dots"):
+                with console.status("Sending the grade request to Canvas…", spinner="dots"):
                     kind, progress = client.update_grades(
-                        course_id, int(assignment["id"]), payload
+                        course_id,
+                        int(assignment["id"]),
+                        payload,
+                        max_workers=concurrency,
                     )
-                    if kind == "bulk":
-                        final = wait_for_progress(client, progress)
-                        state = final.get("workflow_state")
-                        if state == "failed":
+
+                job_completed = False
+                if kind == "bulk":
+                    progress_id = progress.get("id")
+                    console.print(
+                        f"[green]✓ Canvas accepted the bulk grade request[/green] "
+                        f"for {len(payload)} student(s)."
+                    )
+
+                    if progress_id is not None and wait_timeout > 0:
+                        console.print(
+                            f"[bold]Waiting[/bold] up to [cyan]{wait_timeout:g}s[/cyan] "
+                            "for Canvas to apply the grades…"
+                        )
+                        with console.status(
+                            "Waiting for Canvas to finish the grade job…",
+                            spinner="dots",
+                        ):
+                            final = client.wait_for_progress(
+                                int(progress_id), timeout=wait_timeout
+                            )
+
+                        if final is None:
+                            console.print(
+                                f"[yellow]⚠ Canvas is still applying the grades after "
+                                f"{wait_timeout:g}s.[/yellow] They will finish in the "
+                                "background; verification was skipped. Increase "
+                                "--canvas-wait to wait longer."
+                            )
+                        elif str(final.get("workflow_state")) == "failed":
                             message = final.get("message") or "no details"
                             raise CanvasError(f"bulk grade job failed: {message}")
-
-                if kind == "bulk":
-                    console.print(
-                        f"[green]Posted {len(payload)} grade(s) in one bulk request.[/green]"
-                    )
+                        else:
+                            console.print(
+                                "[green]✓ Canvas finished applying the grades.[/green]"
+                            )
+                            job_completed = True
+                    else:
+                        console.print(
+                            "[dim]Not waiting for Canvas to finish "
+                            "(--canvas-wait 0).[/dim]"
+                        )
                 else:
                     console.print(
-                        f"[green]Posted {len(payload)} grade(s) individually "
-                        "(bulk endpoint unavailable).[/green]"
+                        f"[green]✓ Posted {len(payload)} grade(s) individually "
+                        f"using {concurrency} worker(s)[/green] "
+                        "(the bulk endpoint is unavailable on this Canvas)."
                     )
+                    job_completed = True
+
                 pushed += len(payload)
+
+                if verify:
+                    points_possible = assignment.get("points_possible")
+                    if not job_completed:
+                        console.print(
+                            "[yellow]Verification skipped because Canvas is still "
+                            "processing the grades.[/yellow]"
+                        )
+                    elif mode == "percentage" and not isinstance(
+                        points_possible, (int, float)
+                    ):
+                        console.print(
+                            "[yellow]Verification skipped: the assignment's points are unknown.[/yellow]"
+                        )
+                    else:
+                        console.print(
+                            f"[bold]Verifying[/bold] {len(planned)} grade(s) "
+                            "against Canvas…"
+                        )
+                        mismatches = verify_posted_grades(
+                            console,
+                            client,
+                            course_id,
+                            int(assignment["id"]),
+                            planned,
+                            points_possible,
+                        )
+                        if mismatches is not None:
+                            confirmed += len(planned) - mismatches
+                            verification_failures += mismatches
             except CanvasError as exc:
-                console.print(f"[red]{exc}[/red]")
+                console.print(f"[red]✗ {exc}[/red]")
                 failures += 1
 
         summary = f"Grades posted: [green]{pushed}[/green]"
+        if confirmed:
+            summary += f"\nGrades confirmed in Canvas: [green]{confirmed}[/green]"
+        if verification_failures:
+            summary += (
+                f"\nGrades not confirmed by Canvas: "
+                f"[yellow]{verification_failures}[/yellow]"
+            )
         if failures:
             summary += f"\nCourses with errors: [red]{failures}[/red]"
         console.print(
             Panel.fit(summary, title="Summary", border_style="cyan", padding=(0, 2))
         )
-        return 0 if failures == 0 else 1
+        return 0 if failures == 0 and verification_failures == 0 else 1
 
 
 def push_grades(
@@ -860,6 +1066,9 @@ def push_grades(
     dry_run: bool = False,
     grade_mode: str = "auto",
     show_archived: bool = False,
+    wait_timeout: float = 60.0,
+    concurrency: int = 4,
+    verify: bool = True,
 ) -> int:
     console = console or Console()
     try:
@@ -870,6 +1079,9 @@ def push_grades(
             dry_run=dry_run,
             grade_mode=grade_mode,
             show_archived=show_archived,
+            wait_timeout=wait_timeout,
+            concurrency=concurrency,
+            verify=verify,
         )
     except Cancelled:
         console.print("\n[yellow]Cancelled.[/yellow]")

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import io
 import unittest
 
 import httpx
+from rich.console import Console
 
 from attendance_grades.canvas import (
     CanvasClient,
     GradeConfig,
     auto_section,
     canvas_grade,
+    expected_score,
     is_archived,
     match_students,
+    verify_posted_grades,
 )
 
 
@@ -69,10 +73,49 @@ class CanvasClientTests(unittest.TestCase):
             "token",
             transport=httpx.MockTransport(handler),
         )
-        kind, _progress = client.update_grades(1, 2, {10: "3.13"})
+        kind, _progress = client.update_grades(1, 2, {10: "3.13", 11: "5.00"})
 
         self.assertEqual(kind, "individual")
-        self.assertEqual([request.method for request in requests], ["POST", "PUT"])
+        self.assertEqual(requests[0].method, "POST")
+        self.assertEqual(
+            sorted(request.url.path for request in requests[1:]),
+            [
+                "/api/v1/courses/1/assignments/2/submissions/10",
+                "/api/v1/courses/1/assignments/2/submissions/11",
+            ],
+        )
+
+    def test_list_submission_scores(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {"user_id": 10, "score": 4.0},
+                    {"user_id": 11, "score": None},
+                    {"user_id": None, "score": 1.0},
+                ],
+            )
+
+        client = CanvasClient(
+            "https://canvas.example.edu",
+            "token",
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertEqual(
+            client.list_submission_scores(1, 2),
+            {10: 4.0, 11: None},
+        )
+
+    def test_wait_for_progress_times_out_without_raising(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": 5, "workflow_state": "running"})
+
+        client = CanvasClient(
+            "https://canvas.example.edu",
+            "token",
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertIsNone(client.wait_for_progress(5, timeout=0))
 
     def test_archived_courses_are_hidden_unless_requested(self) -> None:
         courses = [
@@ -138,6 +181,54 @@ class MatchingTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_expected_score_for_points_and_percentage(self) -> None:
+        self.assertEqual(expected_score("4.17", 5), 4.17)
+        self.assertEqual(expected_score("80.00%", 5), 4.0)
+        self.assertIsNone(expected_score("80.00%", None))
+
+    def test_verification_reports_mismatches(self) -> None:
+        class StubClient:
+            def list_submission_scores(self, _course_id: int, _assignment_id: int):
+                return {10: 4.0, 11: 3.0}
+
+        planned = [
+            ({"name": "Student One", "grn": "G1"}, {"id": 10}, "email", "4.00"),
+            ({"name": "Student Two", "grn": "G2"}, {"id": 11}, "email", "5.00"),
+        ]
+        console = Console(file=io.StringIO(), width=120)
+
+        mismatches = verify_posted_grades(
+            console,
+            StubClient(),  # type: ignore[arg-type]
+            1,
+            2,
+            planned,
+            5.0,
+        )
+
+        self.assertEqual(mismatches, 1)
+
+    def test_verification_returns_none_when_unavailable(self) -> None:
+        class StubClient:
+            def list_submission_scores(self, _course_id: int, _assignment_id: int):
+                return {}
+
+        planned = [
+            ({"name": "Student One", "grn": "G1"}, {"id": 10}, "email", "4.00"),
+        ]
+        console = Console(file=io.StringIO(), width=120)
+
+        self.assertIsNone(
+            verify_posted_grades(
+                console,
+                StubClient(),  # type: ignore[arg-type]
+                1,
+                2,
+                planned,
+                5.0,
+            )
+        )
+
     def test_auto_section_matches_section_code(self) -> None:
         course = {
             "name": "CMPE 270L-2 (Digital Systems Laboratory)",

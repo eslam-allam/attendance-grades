@@ -1,6 +1,6 @@
 [project]
 name = "attendance-grades"
-version = "0.6.0"
+version = "0.8.0"
 description = "Compute per-section attendance grades out of 5 from an attendance report CSV"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -47,6 +47,9 @@ attendance-grades
 | `--canvas-grade-mode` | `auto` | `auto`, `points`, or `percentage` |
 | `--canvas-dry-run` | off | Preview Canvas matches without posting grades |
 | `--canvas-show-archived` | off | Include archived/completed courses in the course list |
+| `--canvas-wait SECONDS` | `60` | Wait for the bulk job; `0` = fire-and-forget |
+| `--canvas-concurrency N` | `4` | Parallel requests for per-student fallback grading |
+| `--canvas-verify` | on | Read grades back from Canvas after posting (`--no-canvas-verify` to skip) |
 
 Examples:
 
@@ -71,6 +74,9 @@ attendance-grades myReport.csv --push-canvas --canvas-dry-run
 
 # Include archived/completed courses in the Canvas course picker
 attendance-grades myReport.csv --push-canvas --canvas-show-archived
+
+# Post and continue immediately without brief progress polling
+attendance-grades myReport.csv --push-canvas --canvas-wait 0
 ```
 
 ## Pushing grades to Canvas LMS
@@ -97,6 +103,18 @@ by default; use `--canvas-show-archived` if you need them. For each course it:
    will be posted;
 5. asks for confirmation, then posts all grades for the assignment in a single
    bulk request.
+
+Canvas applies bulk grades as a background job. The tool waits up to
+`--canvas-wait` seconds (60 by default) for it to finish, then reads the
+assignment's submissions back from Canvas and reports any grades that did not
+land. If the job is still running after the timeout, the tool warns that
+verification was skipped and lets the job finish in the background. Use
+`--canvas-wait 0` to post and move on immediately, or `--no-canvas-verify` to
+skip the read-back check.
+
+If a Canvas instance does not expose the bulk endpoint, the fallback posts one
+request per student in parallel (`--canvas-concurrency`, 4 workers by default)
+and then verifies those grades too.
 
 Students are never matched by name. If a GRN does not match, you can map the
 student manually by entering their Canvas email or user ID.
