@@ -20,7 +20,6 @@ can be mapped manually by Canvas email or user ID.
 
 from __future__ import annotations
 
-import getpass
 import math
 import os
 import re
@@ -30,9 +29,11 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 import httpx
+import questionary
+from questionary import Choice, Style
 from rich import box
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.panel import Panel
 from rich.table import Table
 
 from .cli import GradeConfig, format_number
@@ -56,6 +57,34 @@ class CanvasError(RuntimeError):
 
 class CanvasAuthError(CanvasError):
     """Canvas rejected the access token."""
+
+
+class Cancelled(Exception):
+    """The user cancelled an interactive prompt."""
+
+
+QSTYLE = Style(
+    [
+        ("qmark", "fg:#00d7d7 bold"),
+        ("question", "bold"),
+        ("answer", "fg:#00d787 bold"),
+        ("pointer", "fg:#00d7d7 bold"),
+        ("highlighted", "fg:#00d7d7 bold"),
+        ("selected", "fg:#00d787"),
+        ("separator", "fg:#6c6c6c"),
+        ("instruction", "fg:#6c6c6c"),
+        ("text", ""),
+        ("disabled", "fg:#6c6c6c italic"),
+    ]
+)
+
+
+def ask(question):
+    """Ask a questionary question, treating Esc/None as a cancellation."""
+    answer = question.ask()
+    if answer is None:
+        raise Cancelled
+    return answer
 
 
 def normalize(value: Any) -> str:
@@ -396,58 +425,26 @@ def auto_section(course: dict[str, Any], section_names: list[str]) -> str | None
 # -- interactive helpers ---------------------------------------------------
 
 
-def parse_selection(raw: str, count: int) -> list[int]:
-    if raw.strip().casefold() == "all":
-        return list(range(1, count + 1))
-
-    selected: list[int] = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if "-" in chunk:
-            start_text, end_text = chunk.split("-", 1)
-            if start_text.strip().isdigit() and end_text.strip().isdigit():
-                start, end = int(start_text), int(end_text)
-                selected.extend(range(start, end + 1))
-                continue
-        if not chunk.isdigit():
-            raise ValueError(f"invalid selection: {chunk!r}")
-        selected.append(int(chunk))
-
-    invalid = [number for number in selected if not 1 <= number <= count]
-    if invalid:
-        raise ValueError(f"selection out of range: {invalid[0]}")
-    return sorted(set(selected))
-
-
-def print_numbered(console: Console, items: list[Any], formatter) -> None:
-    table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
-    table.add_column("#", justify="right", style="dim", no_wrap=True)
-    table.add_column("Item")
-    for number, item in enumerate(items, 1):
-        table.add_row(str(number), formatter(item))
-    console.print(table)
-
-
 def choose_many(
     console: Console,
     items: list[Any],
     title: str,
     formatter,
 ) -> list[Any]:
-    console.print(f"\n[bold cyan]{title}[/bold cyan]")
-    print_numbered(console, items, formatter)
-    while True:
-        raw = Prompt.ask("Select (comma-separated numbers, ranges, or 'all')", default="")
-        try:
-            indexes = parse_selection(raw, len(items))
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            continue
-        if indexes:
-            return [items[index - 1] for index in indexes]
-        console.print("[red]Select at least one item.[/red]")
+    console.print()
+    choices = [Choice(formatter(item), value=item) for item in items]
+    selected = ask(
+        questionary.checkbox(
+            title,
+            choices=choices,
+            style=QSTYLE,
+            instruction="(type to filter, space to select, enter to confirm)",
+            use_search_filter=True,
+            use_jk_keys=False,
+            validate=lambda picked: bool(picked) or "Select at least one course.",
+        )
+    )
+    return list(selected)
 
 
 def choose_one(
@@ -456,18 +453,18 @@ def choose_one(
     title: str,
     formatter,
 ) -> Any:
-    console.print(f"\n[bold cyan]{title}[/bold cyan]")
-    print_numbered(console, items, formatter)
-    while True:
-        raw = Prompt.ask("Select one number", default="1")
-        try:
-            indexes = parse_selection(raw, len(items))
-        except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            continue
-        if len(indexes) == 1:
-            return items[indexes[0] - 1]
-        console.print("[red]Select exactly one item.[/red]")
+    console.print()
+    choices = [Choice(formatter(item), value=item) for item in items]
+    return ask(
+        questionary.select(
+            title,
+            choices=choices,
+            style=QSTYLE,
+            instruction="(type to filter, enter to select)",
+            use_search_filter=True,
+            use_jk_keys=False,
+        )
+    )
 
 
 def course_label(course: dict[str, Any]) -> str:
@@ -485,9 +482,14 @@ def assignment_label(assignment: dict[str, Any]) -> str:
 
 def prompt_connection(console: Console) -> tuple[str, str]:
     env_url = os.environ.get("CANVAS_BASE_URL", "").strip()
-    raw_url = Prompt.ask(
-        "Canvas base URL (e.g. https://school.instructure.com)",
-        default=env_url or None,
+    raw_url = ask(
+        questionary.text(
+            "Canvas base URL",
+            default=env_url,
+            instruction="e.g. https://school.instructure.com",
+            style=QSTYLE,
+            validate=lambda value: bool(value.strip()) or "Enter a Canvas URL.",
+        )
     ).strip()
 
     if not re.match(r"^https?://", raw_url, re.IGNORECASE):
@@ -502,7 +504,7 @@ def prompt_connection(console: Console) -> tuple[str, str]:
         )
 
     env_token = os.environ.get("CANVAS_ACCESS_TOKEN", "")
-    token = getpass.getpass("Canvas access token (input hidden): ").strip()
+    token = ask(questionary.password("Canvas access token", style=QSTYLE)).strip()
     if not token and env_token:
         token = env_token.strip()
     if not token:
@@ -528,12 +530,18 @@ def grade_mode_for_assignment(
         f"[yellow]This assignment is out of {points:g} points, but the grades are "
         f"out of {max_grade:g}.[/yellow]"
     )
-    choice = Prompt.ask(
-        "Post grades as [1] points out of the maximum grade, or [2] percentage",
-        choices=["1", "2"],
-        default="2",
+    choice = ask(
+        questionary.select(
+            "How should grades be posted?",
+            choices=[
+                Choice(f"Points out of {max_grade:g}", value="points"),
+                Choice("Percentage of the maximum", value="percentage"),
+            ],
+            default="percentage",
+            style=QSTYLE,
+        )
     )
-    return "percentage" if choice == "2" else "points"
+    return choice
 
 
 def canvas_grade(grade: float, mode: str, config: GradeConfig) -> str:
@@ -543,7 +551,7 @@ def canvas_grade(grade: float, mode: str, config: GradeConfig) -> str:
     return format_number(grade, config.decimals)
 
 
-def wait_for_progress(console: Console, client: CanvasClient, progress: dict[str, Any]) -> dict[str, Any]:
+def wait_for_progress(client: CanvasClient, progress: dict[str, Any]) -> dict[str, Any]:
     progress_id = progress.get("id")
     if not progress_id:
         return progress
@@ -562,7 +570,7 @@ def wait_for_progress(console: Console, client: CanvasClient, progress: dict[str
 # -- main flow -------------------------------------------------------------
 
 
-def push_grades(
+def _push_grades(
     grades_by_section: dict[str, list[dict[str, Any]]],
     config: GradeConfig,
     *,
@@ -574,6 +582,15 @@ def push_grades(
     console = console or Console()
     section_names = list(grades_by_section)
 
+    console.print(
+        Panel.fit(
+            "[bold cyan]Canvas LMS grade push[/bold cyan]\n"
+            f"[dim]{len(section_names)} report section(s) loaded[/dim]",
+            border_style="cyan",
+            padding=(0, 2),
+        )
+    )
+
     try:
         base_url, token = prompt_connection(console)
     except (KeyboardInterrupt, EOFError):
@@ -582,7 +599,8 @@ def push_grades(
 
     with CanvasClient(base_url, token) as client:
         try:
-            me = client.current_user()
+            with console.status("Connecting to Canvas...", spinner="dots"):
+                me = client.current_user()
         except CanvasAuthError as exc:
             console.print(f"[red]{exc}[/red]")
             return 1
@@ -596,23 +614,24 @@ def push_grades(
         )
 
         try:
-            courses = client.list_courses(include_archived=show_archived)
+            with console.status("Loading Canvas courses...", spinner="dots"):
+                courses = client.list_courses(include_archived=show_archived)
         except CanvasError as exc:
             console.print(f"[red]{exc}[/red]")
             return 1
 
         if not courses and not show_archived:
-            try:
-                include_archived = Confirm.ask(
+            include_archived = ask(
+                questionary.confirm(
                     "No active courses found. Include archived/completed courses?",
                     default=False,
+                    style=QSTYLE,
                 )
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]Cancelled.[/yellow]")
-                return 1
+            )
             if include_archived:
                 try:
-                    courses = client.list_courses(include_archived=True)
+                    with console.status("Reloading courses...", spinner="dots"):
+                        courses = client.list_courses(include_archived=True)
                 except CanvasError as exc:
                     console.print(f"[red]{exc}[/red]")
                     return 1
@@ -663,7 +682,8 @@ def push_grades(
             rows = grades_by_section[section]
 
             try:
-                assignments = client.list_assignments(course_id)
+                with console.status("Loading assignments...", spinner="dots"):
+                    assignments = client.list_assignments(course_id)
             except CanvasError as exc:
                 console.print(f"[red]{exc}[/red]")
                 failures += 1
@@ -686,7 +706,8 @@ def push_grades(
                 return 1
 
             try:
-                users = client.list_students(course_id)
+                with console.status("Loading course roster...", spinner="dots"):
+                    users = client.list_students(course_id)
             except CanvasError as exc:
                 console.print(f"[red]{exc}[/red]")
                 failures += 1
@@ -700,24 +721,29 @@ def push_grades(
                 for row, reason in unmatched:
                     console.print(f"  • {row['name']} ({row['grn']}): {reason}")
 
-                try:
-                    manual = Confirm.ask("Map unmatched students manually by email/user ID?", default=True)
-                except (KeyboardInterrupt, EOFError):
-                    console.print("\n[yellow]Cancelled.[/yellow]")
-                    return 1
+                manual = ask(
+                    questionary.confirm(
+                        "Map unmatched students manually by email/user ID?",
+                        default=True,
+                        style=QSTYLE,
+                    )
+                )
 
                 if manual:
                     used_ids = {user.get("id") for _row, user, _label in matches}
                     remaining = []
                     for row, reason in unmatched:
-                        answer = Prompt.ask(
-                            f"  Canvas email or user ID for {row['name']} ({row['grn']}) "
-                            "(blank to skip)",
-                            default="",
+                        raw = ask(
+                            questionary.text(
+                                f"Canvas email or user ID for {row['name']} ({row['grn']})",
+                                default="",
+                                instruction="(blank to skip)",
+                                style=QSTYLE,
+                            )
                         )
-                        user = resolve_user(answer, users, index, used_ids)
+                        user = resolve_user(raw, users, index, used_ids)
                         if user is None:
-                            if answer.strip():
+                            if raw.strip():
                                 console.print("  [red]No unique Canvas user found; skipping.[/red]")
                             remaining.append((row, reason))
                         else:
@@ -775,14 +801,13 @@ def push_grades(
                 console.print("[yellow]Dry run: grades were not posted.[/yellow]")
                 continue
 
-            try:
-                approved = Confirm.ask(
+            approved = ask(
+                questionary.confirm(
                     f"Push {len(planned)} grade(s) to “{assignment.get('name')}”?",
                     default=False,
+                    style=QSTYLE,
                 )
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]Cancelled.[/yellow]")
-                return 1
+            )
             if not approved:
                 console.print("Skipped.")
                 continue
@@ -793,13 +818,18 @@ def push_grades(
             }
 
             try:
-                kind, progress = client.update_grades(course_id, int(assignment["id"]), payload)
+                with console.status("Posting grades to Canvas...", spinner="dots"):
+                    kind, progress = client.update_grades(
+                        course_id, int(assignment["id"]), payload
+                    )
+                    if kind == "bulk":
+                        final = wait_for_progress(client, progress)
+                        state = final.get("workflow_state")
+                        if state == "failed":
+                            message = final.get("message") or "no details"
+                            raise CanvasError(f"bulk grade job failed: {message}")
+
                 if kind == "bulk":
-                    final = wait_for_progress(console, client, progress)
-                    state = final.get("workflow_state")
-                    if state == "failed":
-                        message = final.get("message") or "no details"
-                        raise CanvasError(f"bulk grade job failed: {message}")
                     console.print(
                         f"[green]Posted {len(payload)} grade(s) in one bulk request.[/green]"
                     )
@@ -813,8 +843,37 @@ def push_grades(
                 console.print(f"[red]{exc}[/red]")
                 failures += 1
 
-        console.rule("[bold]Summary[/bold]")
-        console.print(f"Grades posted: [green]{pushed}[/green]")
+        summary = f"Grades posted: [green]{pushed}[/green]"
         if failures:
-            console.print(f"Courses with errors: [red]{failures}[/red]")
+            summary += f"\nCourses with errors: [red]{failures}[/red]"
+        console.print(
+            Panel.fit(summary, title="Summary", border_style="cyan", padding=(0, 2))
+        )
         return 0 if failures == 0 else 1
+
+
+def push_grades(
+    grades_by_section: dict[str, list[dict[str, Any]]],
+    config: GradeConfig,
+    *,
+    console: Console | None = None,
+    dry_run: bool = False,
+    grade_mode: str = "auto",
+    show_archived: bool = False,
+) -> int:
+    console = console or Console()
+    try:
+        return _push_grades(
+            grades_by_section,
+            config,
+            console=console,
+            dry_run=dry_run,
+            grade_mode=grade_mode,
+            show_archived=show_archived,
+        )
+    except Cancelled:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        return 1

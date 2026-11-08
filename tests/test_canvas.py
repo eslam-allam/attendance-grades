@@ -11,7 +11,6 @@ from attendance_grades.canvas import (
     canvas_grade,
     is_archived,
     match_students,
-    parse_selection,
 )
 
 
@@ -149,10 +148,6 @@ class HelperTests(unittest.TestCase):
             "CMPE 270L-2 (Digital Systems Laboratory)",
         ]
         self.assertEqual(auto_section(course, sections), sections[1])
-
-    def test_parse_selection_supports_ranges(self) -> None:
-        self.assertEqual(parse_selection("1,3-4", 5), [1, 3, 4])
-        self.assertEqual(parse_selection("all", 3), [1, 2, 3])
 
     def test_canvas_grade_modes(self) -> None:
         config = GradeConfig(max_grade=5, decimals=2)

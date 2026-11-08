@@ -82,8 +82,10 @@ attendance-grades myReport.csv --push-canvas
 The tool asks for your Canvas **base URL** (for example
 `https://school.instructure.com`) and an **access token** (entered with hidden
 input). It validates the token, lists your active teacher courses, and lets you
-select one or more courses. Archived/completed courses are hidden by default;
-use `--canvas-show-archived` if you need them. For each course it:
+select one or more courses. Course selection is an interactive checkbox: type
+to filter, press Space to select, and Enter to confirm. Assignments and report
+sections use searchable arrow-key menus. Archived/completed courses are hidden
+by default; use `--canvas-show-archived` if you need them. For each course it:
 
 1. matches the report section (for example `CMPE 270L-2`) to the Canvas course,
    or asks you to choose one;
